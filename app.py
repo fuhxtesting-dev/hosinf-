@@ -1214,6 +1214,138 @@ def delete_backup():
     return jsonify({'error': 'Backup not found'}), 404
 
 # =============================================================================
+# FULL SYSTEM BACKUP / RESTORE (ADMIN ONLY)
+# One single .zip containing ALL servers' files + full details
+# (start command, cwd, auto_restart, restart_interval, notes, group, tags,
+# env_vars, created_at, status) so the entire panel state can be restored
+# on this or any other FX HOSTING instance by re-uploading the zip.
+# =============================================================================
+
+@app.route('/api/backup/full/download')
+@admin_required
+def download_full_backup():
+    import io
+    try:
+        manifest = {
+            'type': 'FX_HOSTING_FULL_BACKUP',
+            'version': 1,
+            'exported_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'servers': {}
+        }
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for sid, s in SERVERS.items():
+                manifest['servers'][sid] = {
+                    'cmd': s.get('cmd', ''),
+                    'cwd': s.get('cwd', ''),
+                    'auto_restart': s.get('auto_restart', False),
+                    'restart_interval': s.get('restart_interval', '1h'),
+                    'status': s.get('status', 'stopped'),
+                    'created_at': s.get('created_at', ''),
+                    'notes': s.get('notes', ''),
+                    'group': s.get('group', 'default'),
+                    'tags': s.get('tags', []),
+                    'env_vars': s.get('env_vars', {})
+                }
+                base_path = s.get('path', '')
+                if base_path and os.path.isdir(base_path):
+                    for root, dirs, files in os.walk(base_path):
+                        for f in files:
+                            abs_path = os.path.join(root, f)
+                            arcname = os.path.join('servers', sid, os.path.relpath(abs_path, base_path))
+                            zf.write(abs_path, arcname)
+            zf.writestr('manifest.json', json.dumps(manifest, indent=2))
+        zip_buffer.seek(0)
+        timestamp = time.strftime('%Y%m%d_%H%M%S')
+        download_name = f"FX_HOSTING_FULL_BACKUP_{timestamp}.zip"
+        log_activity("Full Backup", f"Downloaded full system backup ({len(manifest['servers'])} servers)", "admin")
+        return send_file(zip_buffer, as_attachment=True, download_name=download_name, mimetype='application/zip')
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/backup/full/restore', methods=['POST'])
+@admin_required
+def restore_full_backup():
+    file = request.files.get('backup_file')
+    if not file or not file.filename:
+        return jsonify({'error': 'No backup file uploaded'}), 400
+    backups_dir = os.path.join(BASE_DIR, 'backups')
+    os.makedirs(backups_dir, exist_ok=True)
+    tmp_path = os.path.join(backups_dir, f"__full_restore_{secrets.token_hex(6)}.zip")
+    try:
+        file.save(tmp_path)
+        with zipfile.ZipFile(tmp_path, 'r') as zf:
+            names = zf.namelist()
+            if 'manifest.json' not in names:
+                return jsonify({'error': 'Invalid backup file: manifest.json missing'}), 400
+            manifest = json.loads(zf.read('manifest.json').decode('utf-8'))
+            if manifest.get('type') != 'FX_HOSTING_FULL_BACKUP':
+                return jsonify({'error': 'Invalid backup file: not an FX HOSTING full backup'}), 400
+
+            replace_all = str(request.form.get('replace_all', 'true')).lower() != 'false'
+
+            # Stop every currently running server before touching disk state
+            for sid, s in list(SERVERS.items()):
+                if s.get('process'):
+                    try: kill_process_completely(s['process'])
+                    except Exception: pass
+                    s['process'] = None
+                    s['status'] = 'stopped'
+
+            if replace_all:
+                # Make current state exactly match the backup: drop servers not in it
+                for sid in list(SERVERS.keys()):
+                    if sid not in manifest.get('servers', {}):
+                        if os.path.exists(SERVERS[sid]['path']):
+                            shutil.rmtree(SERVERS[sid]['path'], ignore_errors=True)
+                        del SERVERS[sid]
+
+            restored = 0
+            for sid, meta in manifest.get('servers', {}).items():
+                server_path = os.path.join(UPLOAD_FOLDER, sid)
+                if os.path.exists(server_path):
+                    shutil.rmtree(server_path, ignore_errors=True)
+                os.makedirs(server_path, exist_ok=True)
+                prefix = f"servers/{sid}/"
+                for name in names:
+                    if name.startswith(prefix) and not name.endswith('/'):
+                        rel = name[len(prefix):]
+                        target = os.path.normpath(os.path.join(server_path, rel))
+                        if not os.path.realpath(target).startswith(os.path.realpath(server_path)):
+                            continue
+                        os.makedirs(os.path.dirname(target), exist_ok=True)
+                        with zf.open(name) as src, open(target, 'wb') as dst:
+                            shutil.copyfileobj(src, dst)
+                SERVERS[sid] = {
+                    'process': None,
+                    'cmd': meta.get('cmd', ''),
+                    'cwd': meta.get('cwd', ''),
+                    'logs': [f">>> [FX HOSTING] Restored from full backup at {time.strftime('%Y-%m-%d %H:%M:%S')}"],
+                    'auto_restart': meta.get('auto_restart', False),
+                    'restart_interval': meta.get('restart_interval', '1h'),
+                    'last_start_time': 0,
+                    'status': 'stopped',
+                    'path': server_path,
+                    'created_at': meta.get('created_at', time.strftime('%Y-%m-%d %H:%M:%S')),
+                    'notes': meta.get('notes', ''),
+                    'group': meta.get('group', 'default'),
+                    'tags': meta.get('tags', []),
+                    'env_vars': meta.get('env_vars', {})
+                }
+                restored += 1
+
+        save_servers()
+        log_activity("Full Restore", f"Restored {restored} servers from full system backup", "admin")
+        return jsonify({'status': 'ok', 'restored': restored})
+    except zipfile.BadZipFile:
+        return jsonify({'error': 'Invalid zip file'}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+# =============================================================================
 # TERMINAL (ADMIN ONLY)
 # =============================================================================
 
