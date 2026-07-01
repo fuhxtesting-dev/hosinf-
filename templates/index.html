@@ -1168,7 +1168,31 @@
                     </button>
                 </div>
             </div>
-            
+
+            <div class="fx-card overflow-hidden mb-4">
+                <div class="p-4 border-b border-opacity-20 flex items-center gap-2" style="border-color: var(--primary);">
+                    <i class="fas fa-server" style="color: var(--primary);"></i>
+                    <span class="text-sm font-bold">Full System Backup / Restore</span>
+                </div>
+                <div class="p-4">
+                    <p class="text-[11px] opacity-70 mb-3">
+                        Downloads every server's files together with all details (start command, cwd, auto-restart,
+                        restart interval, notes, group, tags, env vars) in ONE .zip. Upload that same .zip here or on
+                        another FX HOSTING instance to bring every server back exactly as it was.
+                    </p>
+                    <div class="flex flex-wrap gap-2 items-center">
+                        <button onclick="downloadFullBackup()" class="fx-btn fx-btn-info">
+                            <i class="fas fa-cloud-download-alt"></i> Download Full Backup (.zip)
+                        </button>
+                        <button onclick="document.getElementById('full-restore-input').click()" class="fx-btn">
+                            <i class="fas fa-cloud-upload-alt"></i> Restore From Full Backup
+                        </button>
+                        <input type="file" id="full-restore-input" accept=".zip" style="display:none" onchange="restoreFullBackup(this.files[0])">
+                    </div>
+                    <div id="full-restore-progress" class="text-[11px] mt-2 opacity-70" style="display:none;"></div>
+                </div>
+            </div>
+
             <div class="fx-card overflow-hidden mb-4">
                 <div class="p-4 border-b border-opacity-20 flex items-center gap-2" style="border-color: var(--primary);">
                     <i class="fas fa-list" style="color: var(--primary);"></i>
@@ -3096,6 +3120,47 @@
             loadBackups();
         } catch (e) {
             showToast('Error', 'error');
+        }
+    }
+
+    // ===== FULL SYSTEM BACKUP / RESTORE =====
+    function downloadFullBackup() {
+        showToast('Preparing full system backup...');
+        window.location.href = '/api/backup/full/download';
+    }
+
+    async function restoreFullBackup(file) {
+        if (!file) return;
+        if (!file.name.toLowerCase().endsWith('.zip')) {
+            showToast('Please select a .zip full backup file', 'error');
+            return;
+        }
+        if (!confirm('This will REPLACE all current servers (files, start command, restart settings, env vars, etc.) with the contents of this backup. Continue?')) {
+            document.getElementById('full-restore-input').value = '';
+            return;
+        }
+        const progressEl = document.getElementById('full-restore-progress');
+        progressEl.style.display = 'block';
+        progressEl.textContent = 'Uploading and restoring... this can take a while for large backups.';
+        try {
+            const formData = new FormData();
+            formData.append('backup_file', file);
+            formData.append('replace_all', 'true');
+            const res = await fetch('/api/backup/full/restore', { method: 'POST', body: formData });
+            const data = await res.json();
+            if (data.status === 'ok') {
+                progressEl.textContent = 'Restored ' + data.restored + ' server(s) successfully. Reloading...';
+                showToast('Full backup restored! (' + data.restored + ' servers)');
+                setTimeout(() => location.reload(), 1200);
+            } else {
+                progressEl.style.display = 'none';
+                showToast(data.error || 'Restore failed', 'error');
+            }
+        } catch (e) {
+            progressEl.style.display = 'none';
+            showToast('Error restoring backup', 'error');
+        } finally {
+            document.getElementById('full-restore-input').value = '';
         }
     }
     
